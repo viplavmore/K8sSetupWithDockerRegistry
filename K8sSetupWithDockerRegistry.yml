@@ -1,0 +1,496 @@
+/roles/<rolename>/vars/main.yml
+
+---
+# vars file for setup
+dnsname: <Docker Registry Name>
+ports: <PORT>
+drip: <Docker Registry IP>
+resolve1: <Nameserver IP 1>
+resolve2: <Nameserver IP 2>
+
+
+
+/roles/<rolename>/tasks/main.yml
+
+---
+### START : Update the repo to install kubernetes ###
+
+- name: Identifying the old repo files
+  find:
+    paths: /etc/yum.repos.d/
+    patterns: "*.repo"
+  register: files_to_delete
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: repo
+
+- name: Removing old repo files
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  with_items: "{{ files_to_delete.files }}"
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: repo
+
+- name: Update the repo file
+  copy:
+    src: files/bankyum.repo
+    dest: /etc/yum.repos.d/bankyum.repo
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: repo
+
+- name: Clean repository
+  command: yum clean all
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: repo
+
+### END : Update the repo to install kubernetes ###
+
+
+### START : Setup local docker registry ###
+
+- name: Install Docker packages
+  yum:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - docker-engine
+    - python2-cryptography
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: docker
+
+- name: Start & Enble docker service
+  service:
+    name: docker
+    state: started
+    enabled: yes
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: docker
+
+# Creating Dicrectory Structure for Docker Registry
+- name: Create directory structure for Key & Cert generation
+  file:
+    path: /var/lib/{{ item[0] }}/{{ item[1] }}/{{ item[2] }}
+    recurse: yes
+    state: directory
+  with_nested:
+  - [ 'registry' ]
+  - [ 'conf.d' ]
+  - [ 'certs' ]
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+- name: Create directory structure for Local docker registry
+  file:
+    path: /etc/docker/{{ item[0] }}/{{ item[1] }}
+    recurse: yes
+    state: directory
+  with_nested:
+  - [ 'certs.d' ]
+  - [ '{{ dnsname }}:{{ ports }}' ]
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: docker
+
+# Generate Certificate & Key file
+- name: Generate the private key file to sign the CSR
+  openssl_privatekey:
+    path: /var/lib/registry/conf.d/certs/domain.key
+#    passphrase: "{{ private_key_password }}"
+#    cipher: aes256
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+- name: Generate CSR File signed with Private Key
+  openssl_csr:
+    path: /var/lib/registry/conf.d/certs/domain.csr
+    privatekey_path: /var/lib/registry/conf.d/certs/domain.key
+#    privatekey_passphrase: "{{ private_key_password }}"
+    common_name: "{{ dnsname }}"
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+- name: Sign the CSR File as a CA to turn it into Certificate
+  openssl_certificate:
+    path: /var/lib/registry/conf.d/certs/domain.crt
+    privatekey_path: /var/lib/registry/conf.d/certs/domain.key
+#    privatekey_passphrase: "{{ private_key_password }}"
+    csr_path: /var/lib/registry/conf.d/certs/domain.csr
+    provider: selfsigned
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+# Fetching Certificate from DR to local
+- name: fetch certificate from DR registry
+  fetch:
+    src: /var/lib/registry/conf.d/certs/domain.crt
+    dest: /home/opc/ca.crt
+    flat: yes
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+# Move earlier fetched certificate to all servers
+- name: Move Certificate to Local DR path
+  copy:
+    src: /home/opc/ca.crt
+    dest: /etc/docker/certs.d/{{ dnsname }}:{{ ports }}/ca.crt
+#  remote_src: yes
+#  delegate_to: dr
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: docker
+
+# Move config.yml file to DR server
+- name: Move config file to conf.d
+  copy:
+    src: files/config.yml
+    dest: /var/lib/registry/conf.d/
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+# Load the images to Local DR Registry
+- name: Move registry .tar file to /tmp
+  copy:
+    src: files/registryprod.tar
+    dest: /tmp/
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+#- name: Load Image and PUSH to Local Private Registry
+#  docker_image:
+#    name: registry
+#    load_path: /tmp/registryprod.tar
+#    source: load
+#    state: present
+#  when: "{{ inventory_hostname in groups.dr }}"
+
+- name: Load registry image
+  shell: docker load < /tmp/registryprod.tar
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+
+# Tag the image
+#- name: Tag the default registry image
+#  docker_image:
+#    name:
+#    repository:
+#    pull: no
+#    state: present
+#  when: "{{ inventory_hostname in groups.dr }}"
+
+# Run Command
+#- name: Run the registry container
+#  command: cd /var/lib/registry/conf.d
+#  when: "{{ inventory_hostname in groups.dr }}"
+
+# Run Command to start registry container
+- name: Run the registry container
+  command: "docker run -d --restart=always --name registry -v /var/lib/registry/conf.d/certs:/certs -v /var/lib/registry/conf.d/config.yml:/etc/docker/registry/config.yml -e REGISTRY_HTTP_TLS_KEY=/certs/domain.key -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/domain.crt -e REGISTRY_HTTP_ADDR=0.0.0.0:{{ ports }} -p {{ ports }}:{{ ports }} <Docker Registry name>/os/registry:v2.7.1.1"
+  args:
+    chdir: /var/lib/registry/conf.d
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: docker
+
+### END : Setup local docker registry ###
+
+
+### START : K8S Setup Start ###
+
+# Load images to Docker Registry
+- name: Transfer kubernetes files to Docker Registry location
+  copy:
+    src: "{{ item }}"
+    dest: /home/opc/kubernetes/
+  with_fileglob:
+    - "files/kubernetes/*"
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: kubernetes
+
+- name: Load Kubernetes Images
+  command: docker load -i "{{ item }}"
+  with_items:
+    - coredns.tar
+    - flannel.tar
+    - k8s-dns-kube-dns.tar
+    - kube-apiserver.tar
+    - kube-proxy.tar
+    - kube-scheduler.tar
+    - etcd.tar
+    - k8s-dns-dnsmasq-nanny.tar
+    - k8s-dns-sidecar.tar
+    - kube-controller-manager.tar
+    - kubernetes-dashboard-amd64.tar
+    - pause.tar
+  args:
+    chdir: /home/opc/kubernetes
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: kubernetes
+
+# Make entry of Docker Registry server into "/etc/hosts"
+- name: Edit hosts file
+  lineinfile:
+    path: /etc/hosts
+    insertafter: EOF
+    line: "{{ drip }} {{ dnsname }}"
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+# Tag images as per DNS name
+- name: Tag Kubernetes Images
+  shell: docker images | grep <Docker Registry Name> | awk '{print "docker tag " $1":"$2 " {{ dnsname }}:{{ ports }}/kubernetes/"substr($1,<Number till Common Part>)":"$2}'
+  register: result
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: kubernetes
+
+#- name: Debug Result output
+#  debug:
+#    msg: "{{ result.stdout_lines }}"
+#  when: "{{ inventory_hostname in groups.dr }}"
+#  tags: k
+
+- name: Execute Command to TAG the images
+  command: "{{ item }}"
+  with_items: "{{ result.stdout_lines }}"
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: kubernetes
+
+# Push images to Private Local Docker Registry
+- name: Identify Images to PUSH into Docker Registry
+  shell: docker images | grep "{{ dnsname }}:{{ ports }}"/kubernetes | awk '{ print "docker push "$1":"$2}'
+  register: pushImages
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: kubernetes
+
+#- name: Debug Result output
+#  debug:
+#    var: "{{ item }}"
+#  with_items: "{{ pushImages.stdout_lines[1].split()[2] }}"
+#  with_items: pushImages.stdout_lines
+#  when: "{{ inventory_hostname in groups.dr }}"
+#  tags: k
+
+#- name: Push Images to the Docker Registry
+#  docker_image:
+#    name: "{{ item }}"
+#    repository: "{{ dnsname }}:{{ ports }}"
+#    push: yes
+#  with_items: "{{ pushImages.stdout_lines }}"
+#  when: "{{ inventory_hostname in groups.dr }}"
+
+- name: Execute Command to PUSH the images
+  command: "{{ item }}"
+  with_items: "{{ pushImages.stdout_lines }}"
+  when: "{{ inventory_hostname in groups.dr }}"
+  tags: kubernetes
+
+# Create Non-Root User
+- name: Create obpadmin user
+  user:
+    name: <USERNAME>
+    state: present
+    createhome: yes
+    shell: /bin/bash
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Set passwordless SUDO access to the user
+  lineinfile:
+    dest: /etc/sudoers
+    line: '<USERNAME> ALL=(ALL) NOPASSWD: ALL'
+    validate: 'visudo -cf %s'
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+#- name: Make entry in Authorized files
+#  authorized_key:
+#    user: testuser
+#    state: present
+#    key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+
+# Disabling SWAP
+- name: Remove swapfile from /etc/fstab
+  mount:
+    name: "{{ item }}"
+    fstype: swap
+    state: absent
+  with_items:
+    - swap
+    - none
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Disable swap
+  command: swapoff -a
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+# Install Required Packages
+- name: Install Common Packages
+  yum:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - kubeadm
+    - kubelet
+    - kubeadm-ha-setup
+    - docker-engine
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Install Server Packages
+  yum:
+    name: kubectl
+    state: present
+  when: "{{ inventory_hostname in groups.master }}"
+  tags: kubernetes
+
+- name: set PasswordAuthentication yes
+  replace:
+    path: /etc/selinux/config
+    regexp: "SELINUX=disabled"
+    replace: "SELINUX=Permissive"
+    backup: yes
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: iptables setting
+  shell:
+    iptables -P FORWARD ACCEPT
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Install packages on server
+  yum:
+    name: firewalld
+    state: present
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Enable service firewalld
+  service:
+    name: firewalld
+    enabled: yes
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Start service firewalld
+  service:
+    name: firewalld
+    state: started
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+# Enable Rule via firewall
+- name: Firewalld command settings
+  command: "{{item}}"
+  with_items:
+    - firewall-cmd --add-port=6443/tcp
+    - firewall-cmd --add-port=6443/tcp --permanent
+    - firewall-cmd --add-port=2379-2380/tcp
+    - firewall-cmd --add-port=2379-2380/tcp --permanent
+    - firewall-cmd --add-port=10250/tcp
+    - firewall-cmd --add-port=10250/tcp --permanent
+    - firewall-cmd --add-port=10251/tcp
+    - firewall-cmd --add-port=10251/tcp --permanent
+    - firewall-cmd --add-port=10252/tcp
+    - firewall-cmd --add-port=10252/tcp --permanent
+    - firewall-cmd --add-port=10255/tcp
+    - firewall-cmd --add-port=10255/tcp --permanent
+    - firewall-cmd --add-port=8472/udp
+    - firewall-cmd --add-port=8472/udp --permanent
+    - "firewall-cmd --add-port={{ ports }}/udp"
+    - "firewall-cmd --add-port={{ ports }}/udp --permanent"
+    - firewall-cmd --add-masquerade
+    - firewall-cmd --add-masquerade --permanent
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Start service firewalld
+  service:
+    name: firewalld
+    state: restarted
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: setup docker registry path to root user
+  shell: 'export KUBE_REPO_PREFIX="{{ dnsname }}:{{ ports }}/kubernetes"'
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: setup docker registry path to root user
+  shell: echo 'export KUBE_REPO_PREFIX="{{ dnsname }}:{{ ports }}/kubernetes"' > ~/.bashrc
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: add entry in file /proc/sys/net/bridge/bridge-nf-call-iptables
+  shell: echo '1' > /proc/sys/net/bridge/bridge-nf-call-iptables
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Start service docker
+  service:
+    name: docker
+    state: restarted
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+# Run HA file to setup cluster
+- name: Run "ha.yaml" file
+  shell: kubeadm-setup.sh up
+  when: "{{ inventory_hostname in groups.master }}"
+  tags: kubernetes
+
+- name: create .kube directory
+  file:
+    path: $HOME/.kube
+    state: directory
+    mode: 0755
+  when: "{{ inventory_hostname in groups.master }}"
+  tags: kubernetes
+
+- name: copy admin.conf to user's kube config
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    owner: obpadmin
+  when: "{{ inventory_hostname in groups.master }}"
+  tags: kubernetes
+
+- name: Generate join command
+  shell: kubeadm token create --print-join-command
+  register: join_command
+  when: "{{ inventory_hostname in groups.master }}"
+  tags: kubernetes
+
+- name: Copy join command to local file
+  local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"
+  when: "{{ inventory_hostname in groups.master }}"
+  tags: kubernetes
+
+- name: Copy the join command to worker location
+  copy: src=join-command dest=/tmp/join-command.sh mode=0777
+  when: "{{ inventory_hostname in groups.worker }}"
+  tags: kubernetes
+
+- name: Join the node to cluster
+  shell: "export KUBE_REPO_PREFIX={{ dnsname }}:{{ ports }}/kubernetes && sh /tmp/join-command.sh"
+  when: "{{ inventory_hostname in groups.worker }}"
+  tags: kubernetes
+
+# Make entry of Bank servers DNS into "/etc/resolv.conf"
+- name: Edit resolv.conf file
+  lineinfile:
+    path: /etc/resolv.conf
+    insertafter: EOF
+    line: "nameserver {{ resolve1 }}"
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+- name: Edit resolv.conf file
+  lineinfile:
+    path: /etc/resolv.conf
+    insertafter: EOF
+    line: "nameserver {{ resolve2 }}"
+  when: "{{ inventory_hostname in groups.servers }}"
+  tags: kubernetes
+
+### END : K8S Setup Start ###
