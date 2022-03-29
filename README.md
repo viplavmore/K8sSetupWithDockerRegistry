@@ -11,3 +11,5 @@ In case of role, place the variable code on "/roles/\<rolename\>/vars/main.yml" 
   - Docker Registry Name
   - Username
 
+
+** NOTE: While creating Ansible Directory Structure, use this command : **"#ansible-galaxy init rolename"** **
